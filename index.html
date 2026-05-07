@@ -34,8 +34,8 @@
         <h2>🌱 智能浇水</h2>
         <div class="hum-value" id="humDisplay">--</div>
         <div class="range">适宜范围 15% ~ 30%</div>
-        <div class="fixed-ip">蓝牙连接状态: <span id="bleStatus">未连接</span></div>
-        <button id="connectBtn" class="btn-green" onclick="handleConnectBtn()">📶 连接设备</button>
+        <div class="fixed-ip">蓝牙状态: <span id="bleStatus">未连接</span></div>
+        <button id="connectBtn" class="btn-green" onclick="handleConnect()">📶 连接设备</button>
         <hr>
         <p style="font-weight:bold;">停止条件（二选一）</p>
         <div class="radio-group">
@@ -58,14 +58,6 @@
     </div>
 
     <script>
-        if ('serviceWorker' in navigator) {
-            window.addEventListener('load', () => {
-                navigator.serviceWorker.register('/service-worker.js')
-                    .then(reg => console.log('SW registered'))
-                    .catch(err => console.log('SW registration failed', err));
-            });
-        }
-
         const SERVICE_UUID = '4fafc201-1fb5-459e-8fcc-c5c9c331914b';
         const CHAR_HUMIDITY_UUID = 'beb5483e-36e1-4688-b7f5-ea07361b26a8';
         const CHAR_COMMAND_UUID = 'beb5483e-36e1-4688-b7f5-ea07361b26a9';
@@ -79,7 +71,7 @@
         const connectBtn = document.getElementById('connectBtn');
         const bleStatusSpan = document.getElementById('bleStatus');
 
-        function updateConnectBtn() {
+        function updateConnectionUI() {
             if (connected) {
                 connectBtn.innerText = '🔌 断开连接';
                 connectBtn.className = 'btn-red';
@@ -91,67 +83,33 @@
             }
         }
 
-        async function disconnectBLE() {
-            if (bleDevice && bleDevice.gatt.connected) {
-                await bleDevice.gatt.disconnect();
-            }
-            connected = false;
-            updateConnectBtn();
-            updateUI({ state: 'IDLE' });
-        }
-
-        function handleConnectBtn() {
+        async function handleConnect() {
             if (connected) {
-                disconnectBLE();
-            } else {
-                connectBLE();
+                // 断开连接
+                if (bleDevice && bleDevice.gatt.connected) {
+                    await bleDevice.gatt.disconnect();
+                }
+                connected = false;
+                updateConnectionUI();
+                updateUI({ state: 'IDLE' });
+                return;
             }
+            await connect();
         }
 
-        async function connectBLE() {
+        async function connect() {
             try {
-                bleStatusSpan.innerText = '连接中...';
-                let device = null;
-
-                // 1. 尝试从已授权设备列表中选择并连接
-                const devices = await navigator.bluetooth.getDevices();
-                for (let d of devices) {
-                    if (d.name && d.name.startsWith('ESP32_Water')) {
-                        device = d;
-                        break;
-                    }
-                }
-
-                // 2. 如果找到了已授权设备，尝试直接连接
-                if (device) {
-                    try {
-                        // 如果设备未断开则直接使用，否则会抛出异常，从而走 scan 流程
-                        bleServer = await device.gatt.connect();
-                        bleDevice = device;
-                        console.log('直接连接已授权设备成功');
-                    } catch (e) {
-                        console.log('已授权设备重连失败，将重新扫描', e);
-                        device = null;
-                    }
-                }
-
-                // 3. 如果没有成功连接，则弹出扫描窗口
-                if (!device || !bleServer || !bleDevice.gatt.connected) {
-                    if (bleServer) {
-                        try { await bleServer.disconnect(); } catch(e) {}
-                    }
-                    bleDevice = await navigator.bluetooth.requestDevice({
-                        filters: [{ services: [SERVICE_UUID] }]
-                    });
-                    bleServer = await bleDevice.gatt.connect();
-                }
-
-                // 4. 获取服务和特征值
+                bleStatusSpan.innerText = '搜索中...';
+                // 直接弹出设备选择窗口（使用服务UUID过滤）
+                bleDevice = await navigator.bluetooth.requestDevice({
+                    filters: [{ services: [SERVICE_UUID] }]
+                });
+                bleServer = await bleDevice.gatt.connect();
                 const service = await bleServer.getPrimaryService(SERVICE_UUID);
                 humCharacteristic = await service.getCharacteristic(CHAR_HUMIDITY_UUID);
                 cmdCharacteristic = await service.getCharacteristic(CHAR_COMMAND_UUID);
 
-                // 5. 开启通知
+                // 订阅湿度通知
                 await humCharacteristic.startNotifications();
                 humCharacteristic.addEventListener('characteristicvaluechanged', (event) => {
                     const value = new TextDecoder().decode(event.target.value);
@@ -159,27 +117,23 @@
                         const data = JSON.parse(value);
                         document.getElementById('humDisplay').innerText = data.humidity.toFixed(1) + '%';
                         updateUI(data);
-                    } catch(e) {
-                        console.log('解析数据失败', e);
-                    }
+                    } catch(e) {}
                 });
 
-                // 6. 监听设备断开事件
+                // 监听设备断开
                 bleDevice.addEventListener('gattserverdisconnected', () => {
                     connected = false;
-                    updateConnectBtn();
+                    updateConnectionUI();
                     updateUI({ state: 'IDLE' });
-                    console.log('设备已断开');
                 });
 
                 connected = true;
-                updateConnectBtn();
+                updateConnectionUI();
             } catch (error) {
                 bleStatusSpan.innerText = '连接失败';
-                connected = false;
-                updateConnectBtn();
-                console.error('连接失败:', error);
-                alert('连接失败，请确保 ESP32 已开启且在附近，然后重试。');
+                updateConnectionUI();
+                console.error(error);
+                alert('连接失败，请确认：\n1. ESP32 已通电且蓝牙广播中\n2. 手机蓝牙和位置权限已开启\n3. 设备在附近');
             }
         }
 
@@ -207,10 +161,7 @@
         }
 
         function sendCommand(cmd) {
-            if (!cmdCharacteristic) {
-                alert('请先连接设备！');
-                return;
-            }
+            if (!cmdCharacteristic) { alert('请先连接设备'); return; }
             cmdCharacteristic.writeValue(new TextEncoder().encode(cmd));
         }
 
@@ -219,11 +170,9 @@
             if (btn.innerText.includes('开始')) {
                 const mode = document.querySelector('input[name="stopMode"]:checked').value;
                 if (mode === 'hum') {
-                    const target = document.getElementById('targetHum').value;
-                    sendCommand('START_HUM:' + target);
+                    sendCommand('START_HUM:' + document.getElementById('targetHum').value);
                 } else {
-                    const sec = document.getElementById('maxTime').value;
-                    sendCommand('START_TIME:' + sec);
+                    sendCommand('START_TIME:' + document.getElementById('maxTime').value);
                 }
             } else if (btn.innerText.includes('暂停')) {
                 sendCommand('PAUSE');
@@ -246,7 +195,7 @@
             document.getElementById('timeInput').style.display = mode === 'time' ? 'block' : 'none';
         }
 
-        updateConnectBtn();
+        updateConnectionUI();
     </script>
 </body>
 </html>
