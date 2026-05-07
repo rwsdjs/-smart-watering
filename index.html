@@ -78,11 +78,10 @@
         let cmdCharacteristic = null;
         let connected = false;
 
-        // 获取按钮元素
         const connectBtn = document.getElementById('connectBtn');
         const bleStatusSpan = document.getElementById('bleStatus');
 
-        // 更新连接按钮的状态
+        // 更新连接按钮状态
         function updateConnectBtn() {
             if (connected) {
                 connectBtn.innerText = '🔌 断开连接';
@@ -95,17 +94,17 @@
             }
         }
 
-        // 主动断开 BLE 连接
+        // 主动断开 BLE
         async function disconnectBLE() {
             if (bleDevice && bleDevice.gatt.connected) {
                 await bleDevice.gatt.disconnect();
             }
             connected = false;
             updateConnectBtn();
-            updateUI({ state: 'IDLE' }); // 重置水泵状态显示
+            updateUI({ state: 'IDLE' });
         }
 
-        // 连接按钮点击处理：根据当前状态决定是连接还是断开
+        // 连接/断开按钮处理
         function handleConnectBtn() {
             if (connected) {
                 disconnectBLE();
@@ -117,10 +116,21 @@
         async function connectBLE() {
             try {
                 bleStatusSpan.innerText = '连接中...';
-                bleDevice = await navigator.bluetooth.requestDevice({
-                    filters: [{ services: [SERVICE_UUID] }]
-                });
-                bleServer = await bleDevice.gatt.connect();
+                let device = null;
+                // 1. 先尝试获取已授权设备（自动重连）
+                const devices = await navigator.bluetooth.getDevices();
+                device = devices.find(d => d.name && d.name.startsWith('ESP32_Water'));
+
+                // 2. 如果没有，弹出设备选择器
+                if (!device) {
+                    device = await navigator.bluetooth.requestDevice({
+                        filters: [{ services: [SERVICE_UUID] }]
+                    });
+                }
+
+                // 3. 连接
+                bleDevice = device;
+                bleServer = await device.gatt.connect();
                 const service = await bleServer.getPrimaryService(SERVICE_UUID);
                 humCharacteristic = await service.getCharacteristic(CHAR_HUMIDITY_UUID);
                 cmdCharacteristic = await service.getCharacteristic(CHAR_COMMAND_UUID);
@@ -134,12 +144,12 @@
                         document.getElementById('humDisplay').innerText = data.humidity.toFixed(1) + '%';
                         updateUI(data);
                     } catch(e) {
-                        console.log('解析湿度数据失败', e);
+                        console.log('解析数据失败', e);
                     }
                 });
 
-                // 监听设备断开事件
-                bleDevice.addEventListener('gattserverdisconnected', () => {
+                // 监听设备断开
+                device.addEventListener('gattserverdisconnected', () => {
                     connected = false;
                     updateConnectBtn();
                     updateUI({ state: 'IDLE' });
@@ -149,7 +159,7 @@
                 updateConnectBtn();
             } catch (error) {
                 bleStatusSpan.innerText = '连接失败';
-                console.error('BLE 连接失败:', error);
+                console.error('连接失败:', error);
             }
         }
 
@@ -157,7 +167,6 @@
             const pumpBtn = document.getElementById('pumpBtn');
             const stopBtn = document.getElementById('stopBtn');
             const statusDiv = document.getElementById('pumpStatus');
-
             if (data.state === 'RUNNING') {
                 pumpBtn.innerText = '⏸ 暂停';
                 pumpBtn.className = 'btn-orange';
@@ -217,7 +226,7 @@
             document.getElementById('timeInput').style.display = mode === 'time' ? 'block' : 'none';
         }
 
-        // 初始状态
+        // 初始化按钮状态
         updateConnectBtn();
     </script>
 </body>
