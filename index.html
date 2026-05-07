@@ -3,88 +3,55 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    智能浇水系统
-    <link rel="manifest" href="manifest.json">
-    <meta name="theme-color" content="#2e7d32">
+    <title>智能浇水系统 - 调试版</title>
     <style>
         body{font-family:sans-serif;background:#f5f5f5;margin:0;padding:16px;}
         .container{max-width:400px;margin:0 auto;background:white;border-radius:16px;padding:20px;box-shadow:0 2px 8px rgba(0,0,0,0.1);}
         h2{color:#2e7d32;margin:0 0 8px;font-size:22px;}
         .hum-value{font-size:56px;font-weight:bold;color:#333;margin:10px 0;}
-        .range{color:#888;font-size:14px;margin-bottom:20px;}
         button{border:none;padding:12px;border-radius:8px;font-size:16px;margin:6px 0;width:100%;font-weight:bold;}
         .btn-green{background:#2e7d32;color:white;}
-        .btn-blue{background:#1565c0;color:white;}
-        .btn-orange{background:#e65100;color:white;}
-        .btn-gray{background:#757575;color:white;}
         .btn-red{background:#c62828;color:white;}
-        .input-group{margin:12px 0;}
-        .input-group label{display:block;margin-bottom:4px;color:#555;}
-        .input-group input{width:100%;padding:10px;border:1px solid #ddd;border-radius:6px;font-size:16px;box-sizing:border-box;}
-        hr{margin:16px 0;border:none;border-top:1px solid #eee;}
-        .status{font-size:14px;color:#555;margin:8px 0;text-align:center;}
-        .note{font-size:12px;color:#999;text-align:center;margin-top:12px;}
-        .radio-group{display:flex;gap:20px;margin:12px 0;}
-        .radio-group label{display:flex;align-items:center;gap:6px;}
-        .fixed-ip{background:#e8f5e9;color:#2e7d32;padding:8px;border-radius:6px;font-size:12px;text-align:center;margin-bottom:12px;}
+        .log-box{background:#000;color:#0f0;font-family:monospace;padding:10px;font-size:12px;height:200px;overflow-y:auto;margin-top:10px;}
     </style>
 </head>
 <body>
     <div class="container">
-        <h2>🌱 智能浇水</h2>
+        <h2>🌱 智能浇水 (调试版)</h2>
         <div class="hum-value" id="humDisplay">--</div>
-        <div class="range">适宜范围 15% ~ 30%</div>
-        <div class="fixed-ip">蓝牙状态: <span id="bleStatus">未连接</span></div>
         <button id="connectBtn" class="btn-green" onclick="handleConnectBtn()">📶 连接设备</button>
-        <hr>
-        <p style="font-weight:bold;">停止条件（二选一）</p>
-        <div class="radio-group">
-            <label><input type="radio" name="stopMode" value="hum" checked onchange="toggleInputs()"> 湿度优先</label>
-            <label><input type="radio" name="stopMode" value="time" onchange="toggleInputs()"> 时间优先</label>
-        </div>
-        <div id="humInput" class="input-group">
-            <label>目标湿度 (%)</label>
-            <input type="number" id="targetHum" value="25.0" step="0.5" min="15" max="35">
-        </div>
-        <div id="timeInput" class="input-group" style="display:none;">
-            <label>最大时长 (秒)</label>
-            <input type="number" id="maxTime" value="30" step="5" min="5" max="300">
-        </div>
-        <button id="pumpBtn" class="btn-blue" onclick="togglePump()">💧 开始浇水</button>
-        <button id="stopBtn" class="btn-gray" onclick="stopPump()" style="display:none;">⏹ 停止浇水</button>
-        <div id="pumpStatus" class="status">水泵已停止</div>
-        <hr>
-        <div class="note">请先连接设备，再控制浇水</div>
+        <div class="log-box" id="logBox"></div>
     </div>
     <script>
-        // 如果之前注册过 Service Worker，保持注册（可省略）
-        if ('serviceWorker' in navigator) {
-            navigator.serviceWorker.register('/service-worker.js').catch(()=>{});
-        }
         const SERVICE_UUID = '4fafc201-1fb5-459e-8fcc-c5c9c331914b';
         const CHAR_HUMIDITY_UUID = 'beb5483e-36e1-4688-b7f5-ea07361b26a8';
         const CHAR_COMMAND_UUID = 'beb5483e-36e1-4688-b7f5-ea07361b26a9';
+        
         let bleDevice = null;
         let bleServer = null;
         let humCharacteristic = null;
-        let cmdCharacteristic = null;
         let connected = false;
-        const connectBtn = document.getElementById('connectBtn');
-        const bleStatusSpan = document.getElementById('bleStatus');
+
+        function log(msg) {
+            const box = document.getElementById('logBox');
+            box.innerHTML += `[${new Date().toLocaleTimeString()}] ${msg}<br>`;
+            box.scrollTop = box.scrollHeight;
+            console.log(msg);
+        }
+
         function updateConnectionUI() {
+            const btn = document.getElementById('connectBtn');
             if (connected) {
-                connectBtn.innerText = '🔌 断开连接';
-                connectBtn.className = 'btn-red';
-                bleStatusSpan.innerText = '已连接';
+                btn.innerText = '🔌 断开连接';
+                btn.className = 'btn-red';
             } else {
-                connectBtn.innerText = '📶 连接设备';
-                connectBtn.className = 'btn-green';
-                bleStatusSpan.innerText = '未连接';
+                btn.innerText = '📶 连接设备';
+                btn.className = 'btn-green';
             }
         }
+
         async function handleConnectBtn() {
             if (connected) {
-                // 主动断开蓝牙
                 try {
                     if (bleDevice && bleDevice.gatt.connected) {
                         await bleDevice.gatt.disconnect();
@@ -92,113 +59,61 @@
                 } catch(e) {}
                 connected = false;
                 updateConnectionUI();
-                updateUI({ state: 'IDLE' });
                 return;
             }
-            // 连接
+
             try {
-                bleStatusSpan.innerText = '搜索中...';
+                log("1. 开始搜索设备...");
                 bleDevice = await navigator.bluetooth.requestDevice({
                     filters: [{ services: [SERVICE_UUID] }]
                 });
+                log("2. 找到设备: " + bleDevice.name);
+
+                log("3. 正在建立GATT连接...");
                 bleServer = await bleDevice.gatt.connect();
-                
-                // ---------- 修复1: 设置MTU为512，支持大数据包传输 ----------
-                await bleDevice.gatt.setMTU(512);
-                
+                log("4. GATT连接成功！");
+
+                log("5. 正在获取服务...");
                 const service = await bleServer.getPrimaryService(SERVICE_UUID);
+                log("6. 服务获取成功！");
+
+                log("7. 正在获取湿度特征值...");
                 humCharacteristic = await service.getCharacteristic(CHAR_HUMIDITY_UUID);
-                cmdCharacteristic = await service.getCharacteristic(CHAR_COMMAND_UUID);
-                // 订阅湿度通知
+                log("8. 湿度特征值获取成功！");
+
+                log("9. 正在订阅通知...");
                 await humCharacteristic.startNotifications();
                 humCharacteristic.addEventListener('characteristicvaluechanged', (event) => {
                     const value = new TextDecoder().decode(event.target.value);
+                    log("收到数据: " + value);
                     try {
                         const data = JSON.parse(value);
                         document.getElementById('humDisplay').innerText = data.humidity.toFixed(1) + '%';
-                        updateUI(data);
                     } catch(e) {
-                        console.log('数据解析错误', e);
+                        log("数据解析失败: " + e);
                     }
                 });
-                // 监听设备被动断开（例如ESP32重启或超出距离）
+                log("10. 通知订阅成功！");
+
+                log("✅ 全部完成！连接成功！");
+                
                 bleDevice.addEventListener('gattserverdisconnected', () => {
+                    log("⚠️ 设备断开连接");
                     connected = false;
                     updateConnectionUI();
-                    updateUI({ state: 'IDLE' });
                 });
+
                 connected = true;
                 updateConnectionUI();
             } catch(error) {
-                bleStatusSpan.innerText = '连接失败';
+                log("❌ 错误: " + error);
                 console.error(error);
-                alert('连接失败，请确认ESP32已开启且在附近，然后重试。');
+                alert("连接出错，请查看黑色日志框里的具体信息");
             }
         }
-        function updateUI(data) {
-            const pumpBtn = document.getElementById('pumpBtn');
-            const stopBtn = document.getElementById('stopBtn');
-            const statusDiv = document.getElementById('pumpStatus');
-            if (data.state === 'RUNNING') {
-                pumpBtn.innerText = '⏸ 暂停';
-                pumpBtn.className = 'btn-orange';
-                stopBtn.style.display = 'block';
-                // ---------- 修复2: 修复UI字段名，匹配服务端返回的remain和target ----------
-                const info = data.mode === 'hum' ? `目标 ${data.target.toFixed(1)}%` : `剩余 ${data.remain} 秒`;
-                statusDiv.innerText = `运行中，${info}`;
-            } else if (data.state === 'PAUSED') {
-                pumpBtn.innerText = '▶ 继续';
-                pumpBtn.className = 'btn-blue';
-                stopBtn.style.display = 'block';
-                statusDiv.innerText = '已暂停';
-            } else {
-                pumpBtn.innerText = '💧 开始浇水';
-                pumpBtn.className = 'btn-blue';
-                stopBtn.style.display = 'none';
-                statusDiv.innerText = '水泵已停止';
-            }
-        }
-        // ---------- 修复3: 异步发送命令，等待写操作完成，避免出错 ----------
-        async function sendCommand(cmd) {
-            if (!cmdCharacteristic) {
-                alert('请先连接设备！');
-                return;
-            }
-            try {
-                await cmdCharacteristic.writeValue(new TextEncoder().encode(cmd));
-            } catch(e) {
-                console.error('发送命令失败', e);
-                alert('发送命令失败，请重试');
-            }
-        }
-        async function togglePump() {
-            const btn = document.getElementById('pumpBtn');
-            if (btn.innerText.includes('开始')) {
-                const mode = document.querySelector('input[name="stopMode"]:checked').value;
-                if (mode === 'hum') {
-                    await sendCommand('START_HUM:' + document.getElementById('targetHum').value);
-                } else {
-                    await sendCommand('START_TIME:' + document.getElementById('maxTime').value);
-                }
-            } else if (btn.innerText.includes('暂停')) {
-                await sendCommand('PAUSE');
-            } else if (btn.innerText.includes('继续')) {
-                await sendCommand('RESUME');
-            }
-        }
-        async function stopPump() {
-            await sendCommand('STOP');
-            document.getElementById('targetHum').value = '25.0';
-            document.getElementById('maxTime').value = '30';
-            document.querySelector('input[value="hum"]').checked = true;
-            toggleInputs();
-        }
-        function toggleInputs() {
-            const mode = document.querySelector('input[name="stopMode"]:checked').value;
-            document.getElementById('humInput').style.display = mode === 'hum' ? 'block' : 'none';
-            document.getElementById('timeInput').style.display = mode === 'time' ? 'block' : 'none';
-        }
+
         updateConnectionUI();
+        log("页面加载完成，请点击连接按钮");
     </script>
 </body>
 </html>
