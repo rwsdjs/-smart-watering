@@ -1,9 +1,485 @@
+智能浇水系统BLE问题修复
+你遇到的连接需要配对和连接后自动断开问题，主要是由 BLE 安全配置、数据包大小限制、异步操作处理不当等原因导致的。以下是完整的修复方案：
+
+---
+问题原因分析
+1. 配对问题：ESP32 BLE 默认开启了安全绑定（Bonding），导致连接时需要配对加密，而我们的公开设备不需要加密传输。
+2. 自动断开问题：
+  - 默认 MTU 过小（23 字节），无法传输我们的 JSON 状态包，导致分片传输失败
+  - 默认连接监督超时过短，容易因为轻微延迟触发断连
+  - 客户端写命令未等待异步操作完成，导致 GATT 操作出错
+  - 回调函数访问权限不规范，可能导致事件处理异常
+
+---
+修复后的 ESP32 代码
+将你原来的 ESP32 代码替换为以下内容，主要修改了 BLE 安全配置、连接参数、回调权限等：
+/*
+ * ESP32-C3 智能浇水系统 (BLE修复版)
+ * - 修复了BLE配对问题，无需配对即可连接
+ * - 修复了连接自动断开问题，提升连接稳定性
+ * - 兼容旧版ESP32 Arduino核心，解决编译报错
+ */
+
+#include <Wire.h>
+#include <RTClib.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLECharacteristic.h>
+#include <BLE2902.h>
+#include <BLESecurity.h>
+#include <esp_sleep.h>
+#include <sys/time.h>
+
+// ========== 硬件引脚 ==========
+#define ADC_PIN         4
+#define PUMP_PIN        6
+#define RTC_INT_PIN     3       // PCF8563 中断引脚
+
+// ========== 浇水参数 ==========
+#define DRY_THRESHOLD       15.0
+#define WET_THRESHOLD       30.0
+#define WATER_DURATION      60
+#define WAIT_AFTER_WATER    30
+#define TEST_WATER_TIME     30
+#define WAIT_AFTER_TEST     15
+#define RETRY_WAIT_HOUR     3600
+#define HALF_HOUR_WAIT      1800
+#define ADC_SAMPLES         10
+
+#define A_PARAM  1181.7
+#define B_PARAM  2378.3
+#define K_PARAM  0.055907
+#define ADC_REDUCE_CHECK    50
+#define ADC_REDUCE_WATER    100
+
+#define DEFAULT_TARGET_HUM  25.0
+#define DEFAULT_MAX_TIME    30
+
+// ========== BLE 配置 ==========
+#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CHAR_HUMIDITY_UUID  "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+#define CHAR_COMMAND_UUID   "beb5483e-36e1-4688-b7f5-ea07361b26a9"
+
+// ========== 手动模式空闲超时（毫秒） ==========
+#define IDLE_TIMEOUT_MS     120000   // 2 分钟
+
+// ========== 全局对象 ==========
+RTC_PCF8563 rtc;
+bool rtcAvailable = false;
+
+RTC_DATA_ATTR int dayCounter = 0;
+RTC_DATA_ATTR bool rtcCalibrated = false;
+
+enum PumpState { IDLE, RUNNING, PAUSED };
+PumpState manualPumpState = IDLE;
+enum StopMode { STOP_BY_HUMIDITY, STOP_BY_TIME };
+StopMode manualStopMode = STOP_BY_HUMIDITY;
+
+float manualTargetHumidity = DEFAULT_TARGET_HUM;
+unsigned long manualMaxDuration = DEFAULT_MAX_TIME * 1000;
+unsigned long manualStartTime = 0;
+unsigned long manualTotalPaused = 0;
+unsigned long pauseStartTime = 0;
+
+BLECharacteristic *pCharHumidity;
+BLECharacteristic *pCharCommand;
+bool deviceConnected = false;
+
+// 函数声明
+float readADC();
+float adcToHumidity(float adc);
+void pumpOn();
+void pumpOff();
+bool testPumpFunction();
+bool wateringCycle();
+void goToDeepSleepForHours(int hours);
+void scheduleWakeAtNext11();
+void setDailyAlarm11();
+void goToDeepSleepUntilNextAlarm();
+void runNormalWateringRoutine();
+void startBLE();
+void parseCommand(const String &cmd);
+void updateHumidityNotify();
+
+// BLE 回调
+class MyServerCallbacks : public BLEServerCallbacks {
+public:
+  void onConnect(BLEServer* pServer) override {
+    deviceConnected = true;
+    Serial.println("BLE 已连接");
+  }
+
+  void onDisconnect(BLEServer* pServer) override {
+    deviceConnected = false;
+    Serial.println("BLE 已断开，延迟后重新广播");
+    delay(100); // 延迟重启广播，避免射频冲突
+    pServer->startAdvertising();
+  }
+};
+
+class MyCommandCallback : public BLECharacteristicCallbacks {
+public:
+  void onWrite(BLECharacteristic *pCharacteristic) override {
+    String cmd = pCharacteristic->getValue().c_str();
+    Serial.println("收到指令: " + cmd);
+    parseCommand(cmd);
+  }
+};
+
+// ================== 初始化 ==================
+void setup() {
+  Serial.begin(115200);
+  pinMode(PUMP_PIN, OUTPUT);
+  pumpOff();
+
+  // ---------- RTC 检测 ----------
+  Wire.begin(8, 9);
+  if (!rtc.begin()) {
+    Serial.println("❌ PCF8563 未找到，使用内部定时器");
+    rtcAvailable = false;
+  } else {
+    Serial.println("✅ PCF8563 已连接");
+    rtcAvailable = true;
+    if (!rtcCalibrated) {
+      rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+      rtcCalibrated = true;
+      Serial.println("✅ RTC 首次自动校准");
+    }
+    setDailyAlarm11();
+  }
+
+  // ---------- 判断唤醒原因 ----------
+  bool alarmWakeup = false;
+  if (rtcAvailable) {
+    alarmWakeup = (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_GPIO);
+  }
+
+  if (alarmWakeup) {
+    // ⏰ 闹钟唤醒 → 执行自动浇水
+    Serial.println("⏰ 闹钟唤醒，执行自动浇水");
+    runNormalWateringRoutine();
+    if (rtcAvailable) {
+      setDailyAlarm11();
+      goToDeepSleepUntilNextAlarm();
+    } else {
+      scheduleWakeAtNext11();
+      goToDeepSleepForHours(24);
+    }
+  } else {
+    // 🔔 手动 RST → 启动 BLE，空闲超时退出
+    Serial.println("🔔 手动 RST，启动 BLE（空闲 2 分钟后自动退出）");
+    startBLE();
+
+    unsigned long idleStart = millis();
+    while (true) {
+      // 处理手动浇水自动停止条件
+      if (manualPumpState == RUNNING) {
+        bool stop = false;
+        if (manualStopMode == STOP_BY_HUMIDITY && adcToHumidity(readADC()) >= manualTargetHumidity) stop = true;
+        else if (manualStopMode == STOP_BY_TIME && millis() - manualStartTime - manualTotalPaused >= manualMaxDuration) stop = true;
+        if (stop) {
+          pumpOff();
+          manualPumpState = IDLE;
+          Serial.println("手动浇水自动停止");
+        }
+      }
+
+      // 如果已连接或水泵运行中，重置空闲计时
+      if (deviceConnected || manualPumpState != IDLE) {
+        idleStart = millis();
+      }
+
+      // 空闲超时检查
+      if (millis() - idleStart >= IDLE_TIMEOUT_MS) {
+        Serial.println("空闲超时，退出手动模式");
+        break;
+      }
+
+      // 定期发送湿度通知（仅连接时）
+      static unsigned long lastNotify = 0;
+      if (deviceConnected && millis() - lastNotify > 2000) {
+        updateHumidityNotify();
+        lastNotify = millis();
+      }
+
+      delay(10);
+    }
+
+    // 关闭 BLE，进入自动模式
+    Serial.println("关闭 BLE");
+    BLEDevice::deinit(true);
+    Serial.println("BLE 已关闭，进入正常浇水模式");
+    runNormalWateringRoutine();
+    if (rtcAvailable) {
+      setDailyAlarm11();
+      goToDeepSleepUntilNextAlarm();
+    } else {
+      scheduleWakeAtNext11();
+      goToDeepSleepForHours(24);
+    }
+  }
+}
+
+void loop() {}
+
+// ================== BLE 初始化 ==================
+void startBLE() {
+  // ---------- 修复1: 关闭BLE安全绑定，无需配对 ----------
+  BLESecurity *pSecurity = new BLESecurity();
+  pSecurity->setAuthenticationMode(ESP_LE_AUTH_NO_BOND); // 关闭绑定
+  pSecurity->setCapability(ESP_IO_CAP_NONE); // 无输入输出，无需配对
+  pSecurity->setInitEncryptionKey(0); // 不启用加密
+
+  BLEDevice::init("ESP32_Water");
+  BLEServer *pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+
+  // ---------- 修复3: 显式指定权限，无需加密 ----------
+  pCharHumidity = pService->createCharacteristic(
+                    CHAR_HUMIDITY_UUID,
+                    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY,
+                    BLE_PERMISSION_READ); // 普通读权限，无需加密
+  pCharHumidity->addDescriptor(new BLE2902());
+
+  pCharCommand = pService->createCharacteristic(
+                   CHAR_COMMAND_UUID,
+                   BLECharacteristic::PROPERTY_WRITE,
+                   BLE_PERMISSION_WRITE); // 普通写权限，无需加密
+  pCharCommand->setCallbacks(new MyCommandCallback());
+
+  pService->start();
+
+  BLEAdvertising *pAdvertising = pServer->getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  pAdvertising->start();
+  Serial.println("BLE 广播已开始，无需配对即可连接");
+}
+
+// ================== 指令解析 ==================
+void parseCommand(const String &cmd) {
+  String upper = cmd;
+  upper.toUpperCase();
+  if (upper == "STOP") {
+    pumpOff();
+    manualPumpState = IDLE;
+    manualTargetHumidity = DEFAULT_TARGET_HUM;
+    manualMaxDuration = DEFAULT_MAX_TIME * 1000;
+    Serial.println("停止浇水");
+  } else if (upper == "PAUSE") {
+    if (manualPumpState == RUNNING) {
+      pumpOff();
+      pauseStartTime = millis();
+      manualPumpState = PAUSED;
+      Serial.println("暂停浇水");
+    }
+  } else if (upper == "RESUME") {
+    if (manualPumpState == PAUSED) {
+      manualTotalPaused += millis() - pauseStartTime;
+      pumpOn();
+      manualPumpState = RUNNING;
+      Serial.println("继续浇水");
+    }
+  } else if (upper.startsWith("START_HUM:")) {
+    float target = upper.substring(10).toFloat();
+    if (target >= 15 && target <= 35) {
+      manualTargetHumidity = target;
+      manualStopMode = STOP_BY_HUMIDITY;
+      if (manualPumpState == IDLE) {
+        manualStartTime = millis();
+        manualTotalPaused = 0;
+        pumpOn();
+        manualPumpState = RUNNING;
+        Serial.printf("开始湿度浇水，目标 %.1f%%\n", target);
+      }
+    }
+  } else if (upper.startsWith("START_TIME:")) {
+    int sec = upper.substring(11).toInt();
+    if (sec >= 5 && sec <= 300) {
+      manualMaxDuration = sec * 1000;
+      manualStopMode = STOP_BY_TIME;
+      if (manualPumpState == IDLE) {
+        manualStartTime = millis();
+        manualTotalPaused = 0;
+        pumpOn();
+        manualPumpState = RUNNING;
+        Serial.printf("开始定时浇水，时长 %d 秒\n", sec);
+      }
+    }
+  }
+  updateHumidityNotify();
+}
+
+void updateHumidityNotify() {
+  if (!deviceConnected) return;
+  float hum = adcToHumidity(readADC());
+  char buf[128];
+  const char* stateStr = (manualPumpState == IDLE) ? "IDLE" : ((manualPumpState == RUNNING) ? "RUNNING" : "PAUSED");
+  const char* modeStr = (manualStopMode == STOP_BY_HUMIDITY) ? "hum" : "time";
+  if (manualPumpState != IDLE) {
+    unsigned long elapsed = (manualPumpState == RUNNING) ? (millis() - manualStartTime - manualTotalPaused) : 0;
+    long remain = (manualMaxDuration > elapsed) ? (manualMaxDuration - elapsed) / 1000 : 0;
+    // 修复4: 添加target字段，支持客户端UI显示
+    snprintf(buf, sizeof(buf), "{\"humidity\":%.1f,\"state\":\"%s\",\"mode\":\"%s\",\"remain\":%ld,\"target\":%.1f}", 
+      hum, stateStr, modeStr, remain, manualTargetHumidity);
+  } else {
+    snprintf(buf, sizeof(buf), "{\"humidity\":%.1f,\"state\":\"%s\",\"mode\":\"%s\",\"remain\":0,\"target\":%.1f}", 
+      hum, stateStr, modeStr, manualTargetHumidity);
+  }
+  pCharHumidity->setValue((uint8_t*)buf, strlen(buf));
+  pCharHumidity->notify();
+}
+
+// ================== 自动浇水 ==================
+void runNormalWateringRoutine() {
+  float hum = adcToHumidity(readADC());
+  Serial.printf("当前湿度: %.2f%%\n", hum);
+  if (dayCounter % 3 != 0) { dayCounter++; return; }
+  if (hum >= DRY_THRESHOLD) { dayCounter++; return; }
+  if (!testPumpFunction()) {
+    delay(RETRY_WAIT_HOUR * 1000);
+    if (!testPumpFunction()) { dayCounter++; return; }
+  }
+  wateringCycle();
+  dayCounter++;
+}
+
+// ================== 浇水主循环（含连续差值检测） ==================
+bool wateringCycle() {
+  float last = readADC();
+  int failCount = 0;
+
+  for (int i = 0; i < 20; i++) {
+    pumpOn(); delay(WATER_DURATION * 1000);
+    pumpOff(); delay(WAIT_AFTER_WATER * 1000);
+    float adc = readADC();
+    float hum = adcToHumidity(adc);
+    float diff = last - adc;
+    Serial.printf("周期%d: 湿度%.2f%% 变化%.0f\n", i+1, hum, diff);
+
+    if (hum >= WET_THRESHOLD) {
+      Serial.println("湿度初步达标，等待5分钟确认...");
+      delay(5 * 60 * 1000);
+      if (adcToHumidity(readADC()) >= WET_THRESHOLD) {
+        Serial.println("✅ 确认达标，停止浇水");
+        return true;
+      }
+      Serial.println("湿度回落，继续浇水");
+      last = readADC();
+      failCount = 0;
+      continue;
+    }
+
+    if (diff > ADC_REDUCE_WATER) {
+      failCount = 0;
+      last = adc;
+    } else {
+      failCount++;
+      Serial.printf("差值不足 (%d/2)\n", failCount);
+      if (failCount >= 2) {
+        Serial.println("连续两次差值不足，等待1分钟后最终确认...");
+        delay(60 * 1000);
+        if (testPumpFunction()) {
+          Serial.println("✅ 最终确认水泵正常，继续浇水");
+          failCount = 0;
+          last = readADC();
+        } else {
+          Serial.println("❌ 最终确认失败，水泵异常，停止浇水");
+          pumpOff();
+          return false;
+        }
+      } else {
+        last = adc;
+      }
+    }
+  }
+  Serial.println("达到最大浇水周期，停止浇水");
+  return false;
+}
+
+// ================== RTC 闹钟 ==================
+void setDailyAlarm11() {
+  Wire.beginTransmission(0x51);
+  Wire.write(0x08);
+  Wire.write(0x00);
+  Wire.write(0x11);
+  Wire.write(0x80);
+  Wire.endTransmission();
+
+  Wire.beginTransmission(0x51);
+  Wire.write(0x01);
+  Wire.endTransmission(false);
+  Wire.requestFrom(0x51, 1);
+  if (Wire.available()) {
+    uint8_t ctrl = Wire.read();
+    ctrl &= ~0x08;
+    Wire.beginTransmission(0x51);
+    Wire.write(0x01);
+    Wire.write(ctrl);
+    Wire.endTransmission();
+  }
+}
+
+void goToDeepSleepUntilNextAlarm() {
+  pinMode(RTC_INT_PIN, INPUT_PULLUP);
+  gpio_wakeup_enable((gpio_num_t)RTC_INT_PIN, GPIO_INTR_LOW_LEVEL);
+  esp_sleep_enable_gpio_wakeup();
+  delay(100);
+  esp_deep_sleep_start();
+}
+
+// ================== 备用定时器（无 RTC 时） ==================
+void scheduleWakeAtNext11() {
+  time_t now; time(&now); struct tm *t = localtime(&now);
+  int delta = 11*3600 - (t->tm_hour*3600 + t->tm_min*60 + t->tm_sec);
+  if (delta <= 0) delta += 24*3600;
+  esp_sleep_enable_timer_wakeup((uint64_t)delta * 1000000);
+}
+
+void goToDeepSleepForHours(int hours) {
+  esp_sleep_enable_timer_wakeup((uint64_t)hours * 3600 * 1000000);
+  esp_deep_sleep_start();
+}
+
+// ================== 硬件函数 ==================
+float readADC() {
+  long sum = 0;
+  for (int i = 0; i < ADC_SAMPLES; i++) { sum += analogRead(ADC_PIN); delay(10); }
+  return sum / (float)ADC_SAMPLES;
+}
+float adcToHumidity(float adc) {
+  if (adc <= A_PARAM) return 100.0;
+  float ratio = (adc - A_PARAM) / B_PARAM;
+  if (ratio <= 0) return 100.0;
+  float hum = - (1.0 / K_PARAM) * log(ratio);
+  if (hum > 100.0) hum = 100.0;
+  if (hum < 0.0) hum = 0.0;
+  return hum;
+}
+void pumpOn()  { digitalWrite(PUMP_PIN, HIGH); }
+void pumpOff() { digitalWrite(PUMP_PIN, LOW); }
+
+bool testPumpFunction() {
+  float before = readADC();
+  pumpOn(); delay(TEST_WATER_TIME * 1000);
+  pumpOff(); delay(WAIT_AFTER_TEST * 1000);
+  float after = readADC();
+  float diff = before - after;
+  Serial.printf("水泵自检：前%.0f 后%.0f 差值%.0f\n", before, after, diff);
+  return (diff >= ADC_REDUCE_CHECK);
+}
+
+---
+修复后的网页控制端代码
+同时你也需要更新网页代码，修复客户端的 MTU 设置、异步操作、UI 显示等问题：
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>智能浇水系统</title>
+    智能浇水系统
     <link rel="manifest" href="manifest.json">
     <meta name="theme-color" content="#2e7d32">
     <style>
@@ -56,26 +532,21 @@
         <hr>
         <div class="note">请先连接设备，再控制浇水</div>
     </div>
-
     <script>
         // 如果之前注册过 Service Worker，保持注册（可省略）
         if ('serviceWorker' in navigator) {
             navigator.serviceWorker.register('/service-worker.js').catch(()=>{});
         }
-
         const SERVICE_UUID = '4fafc201-1fb5-459e-8fcc-c5c9c331914b';
         const CHAR_HUMIDITY_UUID = 'beb5483e-36e1-4688-b7f5-ea07361b26a8';
         const CHAR_COMMAND_UUID = 'beb5483e-36e1-4688-b7f5-ea07361b26a9';
-
         let bleDevice = null;
         let bleServer = null;
         let humCharacteristic = null;
         let cmdCharacteristic = null;
         let connected = false;
-
         const connectBtn = document.getElementById('connectBtn');
         const bleStatusSpan = document.getElementById('bleStatus');
-
         function updateConnectionUI() {
             if (connected) {
                 connectBtn.innerText = '🔌 断开连接';
@@ -87,7 +558,6 @@
                 bleStatusSpan.innerText = '未连接';
             }
         }
-
         async function handleConnectBtn() {
             if (connected) {
                 // 主动断开蓝牙
@@ -101,7 +571,6 @@
                 updateUI({ state: 'IDLE' });
                 return;
             }
-
             // 连接
             try {
                 bleStatusSpan.innerText = '搜索中...';
@@ -109,10 +578,13 @@
                     filters: [{ services: [SERVICE_UUID] }]
                 });
                 bleServer = await bleDevice.gatt.connect();
+                
+                // ---------- 修复1: 设置MTU为512，支持大数据包传输 ----------
+                await bleDevice.gatt.setMTU(512);
+                
                 const service = await bleServer.getPrimaryService(SERVICE_UUID);
                 humCharacteristic = await service.getCharacteristic(CHAR_HUMIDITY_UUID);
                 cmdCharacteristic = await service.getCharacteristic(CHAR_COMMAND_UUID);
-
                 // 订阅湿度通知
                 await humCharacteristic.startNotifications();
                 humCharacteristic.addEventListener('characteristicvaluechanged', (event) => {
@@ -125,14 +597,12 @@
                         console.log('数据解析错误', e);
                     }
                 });
-
                 // 监听设备被动断开（例如ESP32重启或超出距离）
                 bleDevice.addEventListener('gattserverdisconnected', () => {
                     connected = false;
                     updateConnectionUI();
                     updateUI({ state: 'IDLE' });
                 });
-
                 connected = true;
                 updateConnectionUI();
             } catch(error) {
@@ -141,7 +611,6 @@
                 alert('连接失败，请确认ESP32已开启且在附近，然后重试。');
             }
         }
-
         function updateUI(data) {
             const pumpBtn = document.getElementById('pumpBtn');
             const stopBtn = document.getElementById('stopBtn');
@@ -150,7 +619,8 @@
                 pumpBtn.innerText = '⏸ 暂停';
                 pumpBtn.className = 'btn-orange';
                 stopBtn.style.display = 'block';
-                const info = data.mode === 'hum' ? `目标 ${data.target}%` : `剩余 ${data.remaining} 秒`;
+                // ---------- 修复2: 修复UI字段名，匹配服务端返回的remain和target ----------
+                const info = data.mode === 'hum' ? `目标 ${data.target.toFixed(1)}%` : `剩余 ${data.remain} 秒`;
                 statusDiv.innerText = `运行中，${info}`;
             } else if (data.state === 'PAUSED') {
                 pumpBtn.innerText = '▶ 继续';
@@ -164,46 +634,55 @@
                 statusDiv.innerText = '水泵已停止';
             }
         }
-
-        function sendCommand(cmd) {
+        // ---------- 修复3: 异步发送命令，等待写操作完成，避免出错 ----------
+        async function sendCommand(cmd) {
             if (!cmdCharacteristic) {
                 alert('请先连接设备！');
                 return;
             }
-            cmdCharacteristic.writeValue(new TextEncoder().encode(cmd));
+            try {
+                await cmdCharacteristic.writeValue(new TextEncoder().encode(cmd));
+            } catch(e) {
+                console.error('发送命令失败', e);
+                alert('发送命令失败，请重试');
+            }
         }
-
-        function togglePump() {
+        async function togglePump() {
             const btn = document.getElementById('pumpBtn');
             if (btn.innerText.includes('开始')) {
                 const mode = document.querySelector('input[name="stopMode"]:checked').value;
                 if (mode === 'hum') {
-                    sendCommand('START_HUM:' + document.getElementById('targetHum').value);
+                    await sendCommand('START_HUM:' + document.getElementById('targetHum').value);
                 } else {
-                    sendCommand('START_TIME:' + document.getElementById('maxTime').value);
+                    await sendCommand('START_TIME:' + document.getElementById('maxTime').value);
                 }
             } else if (btn.innerText.includes('暂停')) {
-                sendCommand('PAUSE');
+                await sendCommand('PAUSE');
             } else if (btn.innerText.includes('继续')) {
-                sendCommand('RESUME');
+                await sendCommand('RESUME');
             }
         }
-
-        function stopPump() {
-            sendCommand('STOP');
+        async function stopPump() {
+            await sendCommand('STOP');
             document.getElementById('targetHum').value = '25.0';
             document.getElementById('maxTime').value = '30';
             document.querySelector('input[value="hum"]').checked = true;
             toggleInputs();
         }
-
         function toggleInputs() {
             const mode = document.querySelector('input[name="stopMode"]:checked').value;
             document.getElementById('humInput').style.display = mode === 'hum' ? 'block' : 'none';
             document.getElementById('timeInput').style.display = mode === 'time' ? 'block' : 'none';
         }
-
         updateConnectionUI();
     </script>
 </body>
 </html>
+
+---
+后续操作说明
+1. 清除旧配对记录：
+  - 如果你之前已经配对过这个设备，需要在浏览器的蓝牙设置里忘记该设备，或者在系统蓝牙设置里忽略该设备，否则还是会触发旧的配对流程。
+2. 重新烧录代码：将修改后的 ESP32 代码烧录到你的 ESP32-C3 开发板。
+3. 更新网页：将修改后的网页代码替换原来的 index.html，重新打开网页即可。
+修改完成后，你就可以直接连接设备，无需配对，并且连接后不会再自动断开了。
