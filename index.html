@@ -17,6 +17,7 @@
         .btn-blue{background:#1565c0;color:white;}
         .btn-orange{background:#e65100;color:white;}
         .btn-gray{background:#757575;color:white;}
+        .btn-red{background:#c62828;color:white;}
         .input-group{margin:12px 0;}
         .input-group label{display:block;margin-bottom:4px;color:#555;}
         .input-group input{width:100%;padding:10px;border:1px solid #ddd;border-radius:6px;font-size:16px;box-sizing:border-box;}
@@ -34,7 +35,7 @@
         <div class="hum-value" id="humDisplay">--</div>
         <div class="range">适宜范围 15% ~ 30%</div>
         <div class="fixed-ip">蓝牙连接状态: <span id="bleStatus">未连接</span></div>
-        <button id="connectBtn" class="btn-green" onclick="connectBLE()">📶 连接设备</button>
+        <button id="connectBtn" class="btn-green" onclick="handleConnectBtn()">📶 连接设备</button>
         <hr>
         <p style="font-weight:bold;">停止条件（二选一）</p>
         <div class="radio-group">
@@ -53,7 +54,7 @@
         <button id="stopBtn" class="btn-gray" onclick="stopPump()" style="display:none;">⏹ 停止浇水</button>
         <div id="pumpStatus" class="status">水泵已停止</div>
         <hr>
-        <div class="note">请先点击「连接设备」连接到 ESP32_Water</div>
+        <div class="note">请先连接设备，再控制浇水</div>
     </div>
 
     <script>
@@ -75,10 +76,47 @@
         let bleServer = null;
         let humCharacteristic = null;
         let cmdCharacteristic = null;
+        let connected = false;
+
+        // 获取按钮元素
+        const connectBtn = document.getElementById('connectBtn');
+        const bleStatusSpan = document.getElementById('bleStatus');
+
+        // 更新连接按钮的状态
+        function updateConnectBtn() {
+            if (connected) {
+                connectBtn.innerText = '🔌 断开连接';
+                connectBtn.className = 'btn-red';
+                bleStatusSpan.innerText = '已连接';
+            } else {
+                connectBtn.innerText = '📶 连接设备';
+                connectBtn.className = 'btn-green';
+                bleStatusSpan.innerText = '未连接';
+            }
+        }
+
+        // 主动断开 BLE 连接
+        async function disconnectBLE() {
+            if (bleDevice && bleDevice.gatt.connected) {
+                await bleDevice.gatt.disconnect();
+            }
+            connected = false;
+            updateConnectBtn();
+            updateUI({ state: 'IDLE' }); // 重置水泵状态显示
+        }
+
+        // 连接按钮点击处理：根据当前状态决定是连接还是断开
+        function handleConnectBtn() {
+            if (connected) {
+                disconnectBLE();
+            } else {
+                connectBLE();
+            }
+        }
 
         async function connectBLE() {
             try {
-                document.getElementById('bleStatus').innerText = '连接中...';
+                bleStatusSpan.innerText = '连接中...';
                 bleDevice = await navigator.bluetooth.requestDevice({
                     filters: [{ services: [SERVICE_UUID] }]
                 });
@@ -100,11 +138,17 @@
                     }
                 });
 
-                document.getElementById('bleStatus').innerText = '已连接';
-                document.getElementById('connectBtn').disabled = true;
-                document.getElementById('connectBtn').innerText = '✅ 已连接';
+                // 监听设备断开事件
+                bleDevice.addEventListener('gattserverdisconnected', () => {
+                    connected = false;
+                    updateConnectBtn();
+                    updateUI({ state: 'IDLE' });
+                });
+
+                connected = true;
+                updateConnectBtn();
             } catch (error) {
-                document.getElementById('bleStatus').innerText = '连接失败';
+                bleStatusSpan.innerText = '连接失败';
                 console.error('BLE 连接失败:', error);
             }
         }
@@ -172,6 +216,9 @@
             document.getElementById('humInput').style.display = mode === 'hum' ? 'block' : 'none';
             document.getElementById('timeInput').style.display = mode === 'time' ? 'block' : 'none';
         }
+
+        // 初始状态
+        updateConnectBtn();
     </script>
 </body>
 </html>
