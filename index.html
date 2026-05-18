@@ -13,7 +13,7 @@
 <hr>
 <p>当前时间: <span id="curTime">--</span></p>
 <p>目标浇水时间: <span id="curTarget">--</span></p>
-<p>设置目标时间: <input id="alarmTime" type="time" value="11:00"> <button onclick="setAlarm()">发送</button></p>
+<p>设置目标时间: <input id="alarmTime" type="time" value="11:00"> <button onclick="setAlarm()">发送并保存</button></p>
 <hr>
 <button onclick="sendCmd('EXIT')">退出配网 (EXIT)</button>
 
@@ -33,13 +33,12 @@ async function connect() {
     await humChar.startNotifications();
     humChar.addEventListener('characteristicvaluechanged', e => {
       let data = new TextDecoder().decode(e.target.value);
-      // 处理数据：可能是 JSON 或纯文本
       try {
         let json = JSON.parse(data);
         if (json.time) document.getElementById('curTime').textContent = json.time;
-        if (json.hum) document.getElementById('hum').textContent = json.hum;
+        if (json.hum != null) document.getElementById('hum').textContent = json.hum;
       } catch {
-        // 纯文本，可能是目标时间确认
+        // 非 JSON 文本
         document.getElementById('curTarget').textContent = data;
       }
     });
