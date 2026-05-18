@@ -6,14 +6,17 @@
   button,input{font-size:16px;padding:8px;margin:4px;}
 </style></head>
 <body>
-<h2>智能浇水 - 动态定时器测试</h2>
+<h2>智能浇水 - 最终测试</h2>
 <p>蓝牙状态: <span id="status">未连接</span></p>
 <button onclick="connect()">连接设备</button>
 <button onclick="disconnect()">断开连接</button>
 <hr>
 <p>当前时间: <span id="curTime">--</span></p>
 <p>目标浇水时间: <span id="curTarget">--</span></p>
-<p>设置目标时间: <input id="alarmTime" type="time" value="11:00"> <button onclick="setAlarm()">发送并保存</button></p>
+<p>设置目标时间: <input id="alarmTime" type="time" value="11:00"> <button onclick="setAlarm()">发送</button></p>
+<hr>
+<p>校准当前时间 (手机网络时间):</p>
+<input id="calTime" type="datetime-local" step="1"> <button onclick="calibrate()">发送校准</button>
 <hr>
 <button onclick="sendCmd('EXIT')">退出配网 (EXIT)</button>
 
@@ -38,7 +41,6 @@ async function connect() {
         if (json.time) document.getElementById('curTime').textContent = json.time;
         if (json.hum != null) document.getElementById('hum').textContent = json.hum;
       } catch {
-        // 非 JSON 文本
         document.getElementById('curTarget').textContent = data;
       }
     });
@@ -55,10 +57,19 @@ async function disconnect() {
 }
 
 async function setAlarm() {
-  let time = document.getElementById('alarmTime').value; // HH:MM
+  let time = document.getElementById('alarmTime').value;
   if (!time) return;
   await sendCmd('SETALARM:' + time);
   document.getElementById('curTarget').textContent = time;
+}
+
+async function calibrate() {
+  let dt = document.getElementById('calTime').value; // YYYY-MM-DDTHH:MM
+  if (!dt) return;
+  // 格式化为 SETTIME:YYYY-MM-DD HH:MM:SS
+  let t = dt.replace('T', ' ') + ':00';
+  await sendCmd('SETTIME:' + t);
+  alert('时间已发送校准');
 }
 
 async function sendCmd(cmd) {
