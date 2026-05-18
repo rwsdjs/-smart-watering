@@ -11,8 +11,8 @@
 <button onclick="connect()">连接设备</button>
 <button onclick="disconnect()">断开连接</button>
 <hr>
-<p>湿度: <span id="hum">--</span>%</p>
-<p>当前目标时间: <span id="curTarget">--</span></p>
+<p>当前时间: <span id="curTime">--</span></p>
+<p>目标浇水时间: <span id="curTarget">--</span></p>
 <p>设置目标时间: <input id="alarmTime" type="time" value="11:00"> <button onclick="setAlarm()">发送</button></p>
 <hr>
 <button onclick="sendCmd('EXIT')">退出配网 (EXIT)</button>
@@ -33,10 +33,15 @@ async function connect() {
     await humChar.startNotifications();
     humChar.addEventListener('characteristicvaluechanged', e => {
       let data = new TextDecoder().decode(e.target.value);
+      // 处理数据：可能是 JSON 或纯文本
       try {
         let json = JSON.parse(data);
-        document.getElementById('hum').textContent = json.humidity;
-      } catch { document.getElementById('hum').textContent = data; }
+        if (json.time) document.getElementById('curTime').textContent = json.time;
+        if (json.hum) document.getElementById('hum').textContent = json.hum;
+      } catch {
+        // 纯文本，可能是目标时间确认
+        document.getElementById('curTarget').textContent = data;
+      }
     });
     document.getElementById('status').textContent = '已连接';
     device.addEventListener('gattserverdisconnected', () => {
