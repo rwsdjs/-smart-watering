@@ -1,20 +1,27 @@
 <!DOCTYPE html><html><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>浇水控制</title>
+<title>智能浇水</title>
 <style>
   body{font-family:sans-serif;margin:20px;}
   button,input{font-size:16px;padding:8px;margin:4px;}
 </style></head>
 <body>
-<h2>智能浇水</h2>
+<h2>🌱 智能浇水</h2>
 <p>蓝牙: <span id="status">未连接</span></p>
 <button onclick="connect()">连接设备</button>
 <button onclick="disconnect()">断开连接</button>
 <hr>
-<p>当前时间: <span id="curTime">--:--</span></p>
-<p>目标浇水: <input id="alarmTime" type="time" value="11:00"> <button onclick="setAlarm()">设置</button></p>
+<p>湿度: <span id="hum">--</span>%</p>
+<p>状态: <span id="state">--</span></p>
 <hr>
-<button onclick="sendCmd('EXIT')">退出配网</button>
+<p>目标湿度: <input id="targetHum" type="number" value="25" min="15" max="35" step="0.5"> % <button onclick="startHum()">开始浇水</button></p>
+<p>定时浇水: <input id="maxTime" type="number" value="30" min="5" max="300" step="5"> 秒 <button onclick="startTime()">开始浇水</button></p>
+<hr>
+<button onclick="sendCmd('STOP')">停止</button>
+<button onclick="sendCmd('PAUSE')">暂停</button>
+<button onclick="sendCmd('RESUME')">继续</button>
+<hr>
+<button onclick="sendCmd('EXIT')">退出配网 (EXIT)</button>
 
 <script>
 const SERVICE_UUID = '4fafc201-1fb5-459e-8fcc-c5c9c331914b';
@@ -34,7 +41,8 @@ async function connect() {
       let data = new TextDecoder().decode(e.target.value);
       try {
         let json = JSON.parse(data);
-        if (json.time) document.getElementById('curTime').textContent = json.time;
+        if (json.humidity != null) document.getElementById('hum').textContent = json.humidity;
+        if (json.state) document.getElementById('state').textContent = json.state;
       } catch {}
     });
     document.getElementById('status').textContent = '已连接';
@@ -49,10 +57,14 @@ async function disconnect() {
   document.getElementById('status').textContent = '未连接';
 }
 
-async function setAlarm() {
-  let time = document.getElementById('alarmTime').value;
-  if (!time) return;
-  await sendCmd('SETALARM:' + time);
+async function startHum() {
+  let t = document.getElementById('targetHum').value;
+  await sendCmd('START_HUM:' + t);
+}
+
+async function startTime() {
+  let s = document.getElementById('maxTime').value;
+  await sendCmd('START_TIME:' + s);
 }
 
 async function sendCmd(cmd) {
