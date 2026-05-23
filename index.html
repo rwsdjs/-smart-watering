@@ -37,6 +37,14 @@
         <div class="fixed-ip">蓝牙状态: <span id="bleStatus">未连接</span></div>
         <button id="connectBtn" class="btn-green" onclick="handleConnectBtn()">📶 连接设备</button>
         <hr>
+        <!-- 目标时刻设置 -->
+        <p style="font-weight:bold;">浇水目标时刻</p>
+        <div class="input-group">
+            <label>时刻（小时，0-23）</label>
+            <input type="number" id="targetHour" value="6" min="0" max="23" step="1">
+        </div>
+        <button class="btn-gray" onclick="setTarget()">⏰ 设置目标时刻</button>
+        <hr>
         <p style="font-weight:bold;">停止条件（二选一）</p>
         <div class="radio-group">
             <label><input type="radio" name="stopMode" value="hum" checked onchange="toggleInputs()"> 湿度优先</label>
@@ -54,7 +62,8 @@
         <button id="stopBtn" class="btn-gray" onclick="stopPump()" style="display:none;">⏹ 停止浇水</button>
         <div id="pumpStatus" class="status">水泵已停止</div>
         <hr>
-        <div class="note">请先连接设备，再控制浇水</div>
+        <button class="btn-red" onclick="requestExit()">💤 完成并退出</button>
+        <div class="note">点击退出将自动同步时间并关闭蓝牙</div>
     </div>
 
     <script>
@@ -201,6 +210,35 @@
             const mode = document.querySelector('input[name="stopMode"]:checked').value;
             document.getElementById('humInput').style.display = mode === 'hum' ? 'block' : 'none';
             document.getElementById('timeInput').style.display = mode === 'time' ? 'block' : 'none';
+        }
+
+        // 设置目标时刻
+        function setTarget() {
+            const hour = document.getElementById('targetHour').value;
+            if (hour >= 0 && hour <= 23) {
+                sendCommand('SETTARGET:' + hour);
+                alert('目标时刻已设置为 ' + hour + ':00');
+            }
+        }
+
+        // 退出配网：先发送当前时间戳，再发送EXIT
+        function requestExit() {
+            if (!cmdCharacteristic) {
+                alert('请先连接设备');
+                return;
+            }
+            if (confirm('确定退出配网？将自动同步时间并关闭蓝牙。')) {
+                // 获取当前Unix时间戳（秒）
+                const now = Math.floor(Date.now() / 1000);
+                sendCommand('SETTIME:' + now);
+                // 等待200ms确保SETTIME先被处理，然后发送EXIT
+                setTimeout(() => {
+                    sendCommand('EXIT');
+                }, 200);
+                // 更新界面提示
+                document.getElementById('bleStatus').innerText = '正在退出...';
+                connectBtn.disabled = true;
+            }
         }
 
         updateConnectionUI();
