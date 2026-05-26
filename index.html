@@ -120,9 +120,21 @@
                 cmdCharacteristic = await service.getCharacteristic(CHAR_COMMAND_UUID);
 
                 await humCharacteristic.startNotifications();
+
+                // ========== 关键修复：主动读取目标时刻 ==========
+                try {
+                    const value = await humCharacteristic.readValue();
+                    const text = new TextDecoder().decode(value);
+                    if (text.startsWith('TARGET:')) {
+                        const time = text.substring(7);
+                        document.getElementById('targetTime').value = time;
+                    }
+                } catch(e) {
+                    console.log('读取目标时刻失败', e);
+                }
+
                 humCharacteristic.addEventListener('characteristicvaluechanged', (event) => {
                     const value = new TextDecoder().decode(event.target.value);
-                    // 检查 TARGET: 前缀
                     if (value.startsWith('TARGET:')) {
                         const time = value.substring(7);
                         document.getElementById('targetTime').value = time;
