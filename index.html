@@ -37,7 +37,7 @@
         <div class="fixed-ip">蓝牙状态: <span id="bleStatus">未连接</span></div>
         <button id="connectBtn" class="btn-green" onclick="handleConnectBtn()">📶 连接设备</button>
         <hr>
-        <!-- 目标时刻设置 -->
+        <!-- 目标时刻设置（显示当前值） -->
         <p style="font-weight:bold;">浇水目标时刻</p>
         <div class="input-group">
             <label>时刻 (HH:MM)</label>
@@ -67,7 +67,6 @@
     </div>
 
     <script>
-        // Service Worker (可省略)
         if ('serviceWorker' in navigator) {
             navigator.serviceWorker.register('/service-worker.js').catch(()=>{});
         }
@@ -123,6 +122,12 @@
                 await humCharacteristic.startNotifications();
                 humCharacteristic.addEventListener('characteristicvaluechanged', (event) => {
                     const value = new TextDecoder().decode(event.target.value);
+                    // 检查 TARGET: 前缀
+                    if (value.startsWith('TARGET:')) {
+                        const time = value.substring(7);
+                        document.getElementById('targetTime').value = time;
+                        return;
+                    }
                     try {
                         const data = JSON.parse(value);
                         document.getElementById('humDisplay').innerText = data.humidity.toFixed(1) + '%';
@@ -207,23 +212,22 @@
             document.getElementById('timeInput').style.display = mode === 'time' ? 'block' : 'none';
         }
 
-        // 设置目标时刻
         function setTarget() {
-            const time = document.getElementById('targetTime').value; // HH:MM
+            const time = document.getElementById('targetTime').value;
             if (time) {
                 sendCommand('SETTARGET:' + time);
+                document.getElementById('targetTime').value = time;
                 alert('目标时刻已设置为 ' + time);
             }
         }
 
-        // 退出配网：先发送当前时间戳，再发送 EXIT
         function requestExit() {
             if (!cmdCharacteristic) {
                 alert('请先连接设备');
                 return;
             }
             if (confirm('确定退出配网？将自动同步时间并关闭蓝牙。')) {
-                const now = Math.floor(Date.now() / 1000);  // Unix 时间戳 (秒)
+                const now = Math.floor(Date.now() / 1000);
                 sendCommand('SETTIME:' + now);
                 setTimeout(() => {
                     sendCommand('EXIT');
