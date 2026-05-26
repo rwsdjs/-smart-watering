@@ -37,7 +37,6 @@
         <div class="fixed-ip">蓝牙状态: <span id="bleStatus">未连接</span></div>
         <button id="connectBtn" class="btn-green" onclick="handleConnectBtn()">📶 连接设备</button>
         <hr>
-        <!-- 目标时刻设置（显示当前值） -->
         <p style="font-weight:bold;">浇水目标时刻</p>
         <div class="input-group">
             <label>时刻 (HH:MM)</label>
@@ -67,9 +66,19 @@
     </div>
 
     <script>
+        // Service Worker (可省略)
         if ('serviceWorker' in navigator) {
             navigator.serviceWorker.register('/service-worker.js').catch(()=>{});
         }
+
+        // ========== 关键：页面加载时读取 localStorage，覆盖默认值 ==========
+        (function() {
+            const savedTarget = localStorage.getItem('wateringTargetTime');
+            if (savedTarget) {
+                document.getElementById('targetTime').value = savedTarget;
+                console.log('已加载保存的目标时刻:', savedTarget);
+            }
+        })();
 
         const SERVICE_UUID = '4fafc201-1fb5-459e-8fcc-c5c9c331914b';
         const CHAR_HUMIDITY_UUID = 'beb5483e-36e1-4688-b7f5-ea07361b26a8';
@@ -120,26 +129,8 @@
                 cmdCharacteristic = await service.getCharacteristic(CHAR_COMMAND_UUID);
 
                 await humCharacteristic.startNotifications();
-
-                // ========== 关键修复：主动读取目标时刻 ==========
-                try {
-                    const value = await humCharacteristic.readValue();
-                    const text = new TextDecoder().decode(value);
-                    if (text.startsWith('TARGET:')) {
-                        const time = text.substring(7);
-                        document.getElementById('targetTime').value = time;
-                    }
-                } catch(e) {
-                    console.log('读取目标时刻失败', e);
-                }
-
                 humCharacteristic.addEventListener('characteristicvaluechanged', (event) => {
                     const value = new TextDecoder().decode(event.target.value);
-                    if (value.startsWith('TARGET:')) {
-                        const time = value.substring(7);
-                        document.getElementById('targetTime').value = time;
-                        return;
-                    }
                     try {
                         const data = JSON.parse(value);
                         document.getElementById('humDisplay').innerText = data.humidity.toFixed(1) + '%';
@@ -224,11 +215,13 @@
             document.getElementById('timeInput').style.display = mode === 'time' ? 'block' : 'none';
         }
 
+        // ========== 设置目标时刻（同时保存到 localStorage） ==========
         function setTarget() {
             const time = document.getElementById('targetTime').value;
             if (time) {
                 sendCommand('SETTARGET:' + time);
-                document.getElementById('targetTime').value = time;
+                localStorage.setItem('wateringTargetTime', time);   // 持久化保存
+                document.getElementById('targetTime').value = time; // 立刻更新显示
                 alert('目标时刻已设置为 ' + time);
             }
         }
